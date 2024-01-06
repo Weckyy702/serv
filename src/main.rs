@@ -1,42 +1,51 @@
 use anyhow::{bail, Context, Result};
+use async_watcher::{notify::RecursiveMode, AsyncDebouncer};
+use brotli::{enc::BrotliEncoderParams, BrotliCompress};
 use log::{debug, error, info, trace, warn};
 use std::{
     collections::{HashMap, VecDeque},
     env,
-    fmt::Arguments,
+    fmt::{Arguments, Display},
     fs,
     io::{Cursor, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     str,
     sync::Arc,
+    time::Duration,
 };
-
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpSocket, TcpStream},
     sync::broadcast::{self, Receiver},
 };
 
-use flate2::{write::GzEncoder, Compression};
-
 const REQUEST_BUFFER_SIZE: usize = 4096;
 
 struct File {
     uncompressed: Vec<u8>,
-    gzipped: Vec<u8>,
+    compressed: Vec<u8>,
     mime_type: &'static str,
 }
 
 impl File {
     fn new(uncompressed: Vec<u8>, mime_type: &'static str) -> Result<Self> {
-        let mut encoder = GzEncoder::new(vec![], Compression::default());
-        encoder.write_all(&uncompressed)?;
-        let gzipped = encoder.finish()?;
+        let mut reader = Cursor::new(uncompressed);
+        let mut compressed: Vec<u8> = Vec::new();
+        BrotliCompress(
+            &mut reader,
+            &mut compressed,
+            &BrotliEncoderParams::default(),
+        )?;
+
+        let uncompressed = reader.into_inner();
+
+        let compression_ratio = uncompressed.len() as f64 / compressed.len() as f64;
+        debug!("Compression ratio: {compression_ratio}");
 
         Ok(Self {
             uncompressed,
-            gzipped,
+            compressed,
             mime_type,
         })
     }
@@ -161,7 +170,6 @@ async fn handle_connection(
     let mut buf = [0u8; REQUEST_BUFFER_SIZE];
 
     loop {
-        trace!("Reading from socket...");
         let nread = tokio::select! {
             res = connection.read(&mut buf) => res?,
             _ = notifier.recv() => return Ok(())
@@ -211,11 +219,11 @@ async fn handle_connection(
             }
         };
 
-        let mut use_gzip = false;
+        let mut use_compression = false;
 
         for line in s.lines().take_while(|s| !s.is_empty()) {
             if let Some(line) = line.strip_prefix("Accept-Encoding: ") {
-                use_gzip = line.contains("gzip");
+                use_compression = line.contains("br");
             }
         }
 
@@ -228,18 +236,23 @@ async fn handle_connection(
             continue;
         };
 
-        let content = if use_gzip {
-            &file.gzipped
+        let content = if use_compression {
+            trace!("Client accepts compression :)");
+            &file.compressed
         } else {
             &file.uncompressed
         };
-        let encoding = if use_gzip { "gzip" } else { "none" };
+        let encoding_header = if use_compression {
+            "Content-Encoding: br\r\n"
+        } else {
+            ""
+        };
 
         let response = format_to(&mut buf, format_args!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: keep-alive\r\nContent-Encoding: {}\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: keep-alive\r\n{}\r\n",
                 content.len(),
                 file.mime_type,
-                encoding,
+                encoding_header,
             ))?;
 
         connection.write_all(response.as_bytes()).await?;
