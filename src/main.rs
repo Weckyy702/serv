@@ -285,6 +285,13 @@ async fn main() -> Result<()> {
         task_sender.send(()).expect("Can send shutdown signal");
     });
 
+    let (mut debouncer, mut file_events) =
+        AsyncDebouncer::new_with_channel(Duration::from_secs(1), None).await?;
+
+    debouncer
+        .watcher()
+        .watch(static_dir.as_ref(), RecursiveMode::Recursive)?;
+
     let mut tasks = vec![];
 
     let socket = TcpSocket::new_v4()?;
@@ -308,6 +315,7 @@ async fn main() -> Result<()> {
                 });
                 tasks.push(task);
             },
+            Some(event) = file_events.recv() => println!("{event:?}"),
             _ = receiver.recv() => break,
         };
     }
