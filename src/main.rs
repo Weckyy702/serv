@@ -53,22 +53,29 @@ impl File {
 
 type FileCache = HashMap<PathBuf, File>;
 
-struct Args {
+struct Config {
     backlog: u32,
     addr: SocketAddr,
+    static_dir: String,
 }
 
-impl Default for Args {
+impl Default for Config {
     fn default() -> Self {
         Self {
             backlog: 1024,
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            static_dir: "static".into(),
         }
     }
 }
 
-fn cache_files() -> Result<FileCache> {
-    let mut entries: VecDeque<_> = fs::read_dir("static")?.collect();
+fn cache_files<P>(path: P) -> Result<FileCache>
+where
+    P: AsRef<Path> + Display,
+{
+    let mut entries: VecDeque<_> = fs::read_dir(&path)
+        .with_context(|| format!("Couldn't read directory {}", path))?
+        .collect();
     let mut files = HashMap::new();
 
     while let Some(entry) = entries.pop_front() {
@@ -82,12 +89,14 @@ fn cache_files() -> Result<FileCache> {
 
         let metadata = entry
             .metadata()
-            .with_context(|| format!("Tried reading metadata for {}", entry.path().display()))?;
+            .with_context(|| format!("Couldn't read metadata for {}", entry.path().display()))?;
 
         let path = entry.path();
 
         if metadata.is_dir() {
-            for entry in fs::read_dir(path)? {
+            for entry in fs::read_dir(&path)
+                .with_context(|| format!("Couldn't read directory {}", path.display()))?
+            {
                 entries.push_back(entry)
             }
             continue;
@@ -100,7 +109,7 @@ fn cache_files() -> Result<FileCache> {
 
         let file = File::new(content, mime_type)?;
 
-        //Skip static/
+        //Skip base directory
         let path: PathBuf = path.components().skip(1).collect();
         debug!("Caching as {}", path.display());
         files.insert(path, file);
@@ -119,26 +128,28 @@ fn get_mime_type(path: &Path) -> &'static str {
     }
 }
 
-fn parse_args() -> Result<Args> {
-    let mut args = Args::default();
+fn parse_args() -> Result<Config> {
+    let mut args = Config::default();
 
     for arg in env::args() {
-        if arg.starts_with("--backlog=") {
-            args.backlog = arg[10..]
+        if let Some(backlog) = arg.strip_prefix("--backlog=") {
+            args.backlog = backlog
                 .parse()
-                .with_context(|| format!("Cannot parse {} as a number", &arg[10..]))?;
-        } else if arg.starts_with("--addr=") {
-            let ip = arg[7..]
+                .with_context(|| format!("Cannot parse {} as a number", backlog))?;
+        } else if let Some(ip) = arg.strip_prefix("--addr=") {
+            let ip = ip
                 .parse()
-                .with_context(|| format!("Cannot parse {} as an ip address", &arg[7..]))?;
+                .with_context(|| format!("Cannot parse {} as an ip address", ip))?;
 
             args.addr.set_ip(ip);
-        } else if arg.starts_with("--port=") {
-            let port = arg[7..]
+        } else if let Some(port) = arg.strip_prefix("--port=") {
+            let port = port
                 .parse()
-                .with_context(|| format!("Cannot parse {} as a port number", &arg[7..]))?;
+                .with_context(|| format!("Cannot parse {} as a port number", port))?;
 
             args.addr.set_port(port);
+        } else if let Some(dir) = arg.strip_prefix("--dir=") {
+            args.static_dir = dir.into();
         } else {
             warn!("Unknown argument {arg}");
         }
@@ -269,12 +280,18 @@ async fn handle_connection(
 async fn main() -> Result<()> {
     env_logger::init();
 
-    let Args { backlog, addr } = parse_args()?;
+    let Config {
+        backlog,
+        addr,
+        static_dir,
+    } = parse_args()?;
 
     debug!("connection backlog = {backlog}");
 
-    let files = Arc::new(cache_files()?);
+    //Cache files
+    let files = Arc::new(cache_files(&static_dir)?);
 
+    //Initialize shutdown channel
     let (sender, mut receiver) = broadcast::channel(backlog as usize);
 
     let task_sender = sender.clone();
