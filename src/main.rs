@@ -15,6 +15,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpSocket, TcpStream},
+    sync::broadcast::{self, Receiver},
 };
 
 use flate2::{write::GzEncoder, Compression};
@@ -150,14 +151,21 @@ fn format_to<'buf>(buf: &'buf mut [u8], fmt: Arguments) -> Result<&'buf str> {
     Ok(s)
 }
 
-async fn handle_connection(connection: TcpStream, files: &FileCache) -> Result<()> {
+async fn handle_connection(
+    connection: TcpStream,
+    mut notifier: Receiver<()>,
+    files: &FileCache,
+) -> Result<()> {
     let mut connection = BufStream::new(connection);
 
     let mut buf = [0u8; REQUEST_BUFFER_SIZE];
 
     loop {
         trace!("Reading from socket...");
-        let nread = connection.read(&mut buf).await?;
+        let nread = tokio::select! {
+            res = connection.read(&mut buf) => res?,
+            _ = notifier.recv() => return Ok(())
+        };
         if nread == 0 {
             break;
         }
@@ -254,6 +262,18 @@ async fn main() -> Result<()> {
 
     let files = Arc::new(cache_files()?);
 
+    let (sender, mut receiver) = broadcast::channel(backlog as usize);
+
+    let task_sender = sender.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Can listen for CTRL-C");
+        task_sender.send(()).expect("Can send shutdown signal");
+    });
+
+    let mut tasks = vec![];
+
     let socket = TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
 
@@ -263,15 +283,29 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
-           Ok((connection, addr)) = socket.accept() => {
-               debug!("Got connection from {}", addr);
-               let files = Arc::clone(&files);
-               tokio::spawn(async move {
-                   if let Err(e) = handle_connection(connection, &files).await {
-                       warn!("Failed to handle connection {addr} : {e}");
-                   }
-               });
-           },
+            Ok((connection, addr)) = socket.accept() => {
+                debug!("Got connection from {}", addr);
+
+                let files = Arc::clone(&files);
+                let receiver = sender.subscribe();
+                let task = tokio::spawn(async move {
+                    if let Err(e) = handle_connection(connection, receiver, &files).await {
+                        warn!("Failed to handle connection {addr} : {e}");
+                    }
+                });
+                tasks.push(task);
+            },
+            _ = receiver.recv() => break,
         };
     }
+
+    info!("Received shutdown signal. Goodybe :)");
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            error!("Handler panicked: {e}");
+        }
+    }
+
+    Ok(())
 }

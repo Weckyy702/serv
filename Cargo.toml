@@ -10,4 +10,4 @@ anyhow = "1.0.77"
 env_logger = "0.10.1"
 flate2 = "1.0.28"
 log = "0.4.20"
-tokio = { version = "1.35.1", features = ["macros", "net", "rt-multi-thread", "io-util"]}
+tokio = { version = "1.35.1", features = ["macros", "net", "rt-multi-thread", "io-util", "sync", "signal"]}
